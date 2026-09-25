@@ -64,6 +64,7 @@ def validate_artifacts(
     except (OSError, UnicodeDecodeError) as exc:
         raise ValueError("traces/trace.jsonl is missing or not UTF-8") from exc
     normalized_lines: list[str] = []
+    events_by_case: dict[str, list[dict[str, Any]]] = {case_id: [] for case_id in case_set.case_ids}
     seen_events: set[str] = set()
     for number, line in enumerate(trace_lines, 1):
         if not line.strip():
@@ -78,12 +79,53 @@ def validate_artifacts(
         if event["event_id"] in seen_events:
             raise ValueError(f"traces/trace.jsonl:{number}: duplicate event_id")
         seen_events.add(event["event_id"])
+        events_by_case[event["case_id"]].append(event)
         normalized_lines.append(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
+
+    _validate_lifecycle_events(outputs, events_by_case)
 
     serialized = [json.dumps(value, ensure_ascii=False) for value in outputs.values()]
     if SECRET_PATTERN.search("\n".join([*serialized, *normalized_lines])):
         raise ValueError("a Team API Key appears in output or trace")
     return outputs, normalized_lines
+
+
+def _validate_lifecycle_events(
+    outputs: dict[str, dict[str, Any]], events_by_case: dict[str, list[dict[str, Any]]]
+) -> None:
+    required_order = [
+        "case_received",
+        "task_assigned",
+        "handoff",
+        "policy_decided",
+        "verification_completed",
+        "case_finalized",
+    ]
+    for case_id, events in events_by_case.items():
+        event_types = [event["event_type"] for event in events]
+        cursor = -1
+        for event_type in required_order:
+            try:
+                cursor = event_types.index(event_type, cursor + 1)
+            except ValueError as exc:
+                raise ValueError(
+                    f"traces/trace.jsonl: {case_id} missing lifecycle event {event_type}"
+                ) from exc
+
+        output_refs = set(outputs[case_id].get("evidence_refs", []))
+        if not output_refs:
+            continue
+        consumed_refs = {
+            ref
+            for event in events
+            if event["event_type"] == "tool_result_consumed"
+            for ref in event.get("evidence_refs", [])
+        }
+        missing = sorted(output_refs - consumed_refs)
+        if missing:
+            raise ValueError(
+                f"traces/trace.jsonl: {case_id} output evidence refs were not consumed: {missing}"
+            )
 
 
 def package_submission(root: Path, destination: Path) -> Path:
