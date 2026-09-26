@@ -14,6 +14,99 @@ from .contracts import Contracts
 SECRET_PATTERN = re.compile(r"sk-team-[A-Za-z0-9_-]{8,}")
 MAX_FILE_BYTES = 1024 * 1024
 MAX_SUBMISSION_BYTES = 12 * 1024 * 1024
+REQUIRED_LIFECYCLE = (
+    'case_received',
+    'task_assigned',
+    'tool_result_consumed',
+    'handoff',
+    'policy_decided',
+    'verification_completed',
+    'case_finalized',
+)
+
+
+def _validate_case_lifecycle(
+    case_id: str,
+    events: list[dict[str, Any]],
+    evidence_refs: list[str],
+    output_claims: list[dict[str, Any]] | None = None,
+) -> None:
+    event_types = [event['event_type'] for event in events]
+    cursor = -1
+    for required in REQUIRED_LIFECYCLE:
+        try:
+            cursor = event_types.index(required, cursor + 1)
+        except ValueError as exc:
+            raise ValueError(
+                f'{case_id}: trace lifecycle is missing or out of order: {required}'
+            ) from exc
+    if event_types.count('case_received') != 1 or event_types.count('case_finalized') != 1:
+        raise ValueError(f'{case_id}: trace must contain one receive and one finalize event')
+    if event_types[0] != 'case_received' or event_types[-1] != 'case_finalized':
+        raise ValueError(f'{case_id}: trace receive/finalize boundaries are invalid')
+    submitted_refs = set(evidence_refs)
+    for output_claim in output_claims or ():
+        submitted_refs.update(output_claim.get('evidence_refs', ()))
+    consumed = {
+        ref
+        for event in events
+        if event['event_type'] == 'tool_result_consumed'
+        for ref in event.get('evidence_refs', [])
+    }
+    if not submitted_refs <= consumed:
+        raise ValueError(f'{case_id}: output evidence is not linked to consumed tool results')
+    specialists = {'order-item-agent', 'payment-agent', 'shipment-agent'}
+    expected_actors = {
+        'case_received': 'coordinator',
+        'task_assigned': 'coordinator',
+        'policy_decided': 'policy-agent',
+        'verification_completed': 'verifier-agent',
+        'case_finalized': 'coordinator',
+    }
+    for event in events:
+        event_type = event['event_type']
+        expected_actor = expected_actors.get(event_type)
+        if expected_actor and event.get('actor') != expected_actor:
+            raise ValueError(f'{case_id}: invalid actor for {event_type}')
+        if event_type == 'task_assigned' and event.get('target') not in (
+            specialists | {'policy-agent'}
+        ):
+            raise ValueError(f'{case_id}: invalid task assignment target')
+        if event_type == 'tool_result_consumed' and (
+            event.get('actor') not in specialists | {'policy-agent'}
+            or not event.get('tool_name')
+            or not event.get('evidence_refs')
+        ):
+            raise ValueError(f'{case_id}: invalid tool consumption event')
+        if event_type == 'handoff':
+            actor, target = event.get('actor'), event.get('target')
+            if not (
+                actor in specialists and target == 'policy-agent'
+                or actor == 'policy-agent' and target == 'verifier-agent'
+            ):
+                raise ValueError(f'{case_id}: invalid handoff')
+        if event_type == 'verification_completed' and event.get('target') != 'coordinator':
+            raise ValueError(f'{case_id}: verifier must hand result to coordinator')
+    assigned = {
+        event.get('target') for event in events if event['event_type'] == 'task_assigned'
+    }
+    if not specialists | {'policy-agent'} <= assigned:
+        raise ValueError(f'{case_id}: specialist/policy task assignments are incomplete')
+    handoffs = {
+        (event.get('actor'), event.get('target'))
+        for event in events
+        if event['event_type'] == 'handoff'
+    }
+    required_handoffs = {
+        *((actor, 'policy-agent') for actor in specialists),
+        ('policy-agent', 'verifier-agent'),
+    }
+    if not required_handoffs <= handoffs:
+        raise ValueError(f'{case_id}: agent handoffs are incomplete')
+    if event_types.count('policy_decided') != 1 or event_types.count(
+        'verification_completed'
+    ) != 1:
+        raise ValueError(f'{case_id}: policy and verification must complete exactly once')
 
 
 def _json_object(path: Path) -> dict[str, Any]:
@@ -83,6 +176,17 @@ def validate_artifacts(
     serialized = [json.dumps(value, ensure_ascii=False) for value in outputs.values()]
     if SECRET_PATTERN.search("\n".join([*serialized, *normalized_lines])):
         raise ValueError("a Team API Key appears in output or trace")
+    events_by_case: dict[str, list[dict[str, Any]]] = {case_id: [] for case_id in expected}
+    for line in normalized_lines:
+        event = json.loads(line)
+        events_by_case[event['case_id']].append(event)
+    for case_id, output in outputs.items():
+        _validate_case_lifecycle(
+            case_id,
+            events_by_case[case_id],
+            output['evidence_refs'],
+            output.get('claim_assessments', []),
+        )
     return outputs, normalized_lines
 
 
